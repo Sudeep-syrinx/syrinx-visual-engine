@@ -1,0 +1,517 @@
+name: Releases
+on:
+  push:
+    tags:
+      - 'processing-*'
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.tag_info.outputs.revision }}
+      version: ${{ steps.tag_info.outputs.version }}
+      is_prerelease: ${{ steps.tag_info.outputs.is_prerelease }}
+      asset_version: ${{ steps.tag_info.outputs.asset_version }}
+      release_title: ${{ steps.tag_info.outputs.release_title }}
+    steps:
+      - name: Extract version and revision
+        id: tag_info
+        shell: bash
+        run: |
+          # Tags are shaped processing-<revision>-<version>[-rc<N>].
+          # A trailing -rc<N> marks a release candidate (a public GitHub
+          # prerelease); without it the tag is a final release.
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          REVISION=$(echo "$TAG_NAME" | cut -d'-' -f2)
+          VERSION=$(echo "$TAG_NAME" | cut -d'-' -f3)
+          RC=$(echo "$TAG_NAME" | cut -d'-' -f4)
+
+          # Set outputs for use in later jobs or steps
+          echo "revision=$REVISION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # The packaged version stays numeric (installer formats require it);
+          # the RC marker only rides along in the release title and asset names.
+          if [ -n "$RC" ]; then
+            RC_UPPER=$(echo "$RC" | tr '[:lower:]' '[:upper:]')
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "asset_version=${VERSION}-${RC}" >> $GITHUB_OUTPUT
+            echo "release_title=Processing ${VERSION} ${RC_UPPER}" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "asset_version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "release_title=Processing ${VERSION}" >> $GITHUB_OUTPUT
+          fi
+
+  create-draft:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    needs: version
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      TITLE: ${{ needs.version.outputs.release_title }}
+    steps:
+      - name: Create draft release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release for $TAG already exists; leaving it as-is."
+          else
+            gh release create "$TAG" \
+              --draft \
+              --title "$TITLE" \
+              --generate-notes
+          fi
+
+  reference:
+    name: Publish Processing Reference to release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs: [version, create-draft]
+    steps:
+    - name: Checkout Website Repository
+      uses: actions/checkout@v4
+      with:
+        repository: processing/processing-website
+    - name: Use Node.js 16
+      uses: actions/setup-node@v3
+      with:
+        node-version: 16
+    - name: Install dependencies
+      run: npm ci
+    - name: Build
+      run: npm run build
+    - name: Make reference.zip
+      run: npm run zip
+    - name: Stage reference asset
+      env:
+        ASSET_VERSION: ${{ needs.version.outputs.asset_version }}
+      run: |
+        mkdir -p release-assets
+        cp reference.zip "release-assets/processing-${ASSET_VERSION}-reference.zip"
+    - name: Upload reference to release
+      uses: softprops/action-gh-release@v2
+      with:
+        draft: true
+        tag_name: ${{ github.ref_name }}
+        files: release-assets/processing-${{ needs.version.outputs.asset_version }}-reference.zip
+
+  publish-maven:
+    name: Publish Processing Libraries to Maven Central
+    runs-on: ubuntu-latest
+    needs: [version, release-windows, release-macos, release-linux]
+    # Release candidates must not notify Maven Central.
+    if: ${{ needs.version.outputs.is_prerelease != 'true' }}
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup Processing
+      uses: ./.github/actions/setup
+
+    - name: Build with Gradle
+      run: ./gradlew publish
+      env:
+        MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+        MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+
+        ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+        ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+
+        ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+        ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
+
+        ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+        ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+
+  publish-gradle:
+    name: Publish Processing Plugins to Gradle Plugin Portal
+    runs-on: ubuntu-latest
+    needs: [version, release-windows, release-macos, release-linux]
+    # Release candidates must not notify the Gradle Plugin Portal.
+    if: ${{ needs.version.outputs.is_prerelease != 'true' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Processing
+        uses: ./.github/actions/setup
+
+      - name: Publish plugins to Gradle Plugin Portal
+        run: ./gradlew publishPlugins
+        env:
+          GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+          GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
+
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
+
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+
+      - name: Publish internal plugins to Gradle Plugin Portal
+        run: ./gradlew -p gradle/plugins publishPlugins
+        env:
+          GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+          GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
+
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
+
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+          ORG_GRADLE_PROJECT_publishingGroup: ${{ vars.GRADLE_GROUP }}
+
+  release-windows:
+    name: (windows/${{ matrix.arch }}) Create Processing Release
+    runs-on: ${{ matrix.os }}
+    needs: [version, create-draft]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+#          - arch: aarch64
+#            os: windows-11-arm
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Processing
+        uses: ./.github/actions/setup
+
+      - name: Build with Gradle
+        run: ./gradlew packageDistributionForCurrentOS
+        env:
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+          ORG_GRADLE_PROJECT_revision: ${{ needs.version.outputs.revision }}
+
+      - name: Sign files with Trusted Signing
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+          files-folder: app/build/compose/binaries/main/msi
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Stage release assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ASSET_VERSION: ${{ needs.version.outputs.asset_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p release-assets
+          cp "app/build/compose/binaries/main/Processing-${VERSION}.zip" "release-assets/processing-${ASSET_VERSION}-windows-${ARCH}-portable.zip"
+          cp "app/build/compose/binaries/main/msi/Processing-${VERSION}.msi" "release-assets/processing-${ASSET_VERSION}-windows-${ARCH}.msi"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+
+  release-macos:
+    name: (macOS/${{ matrix.arch }}) Create Processing Release
+    runs-on: macos-latest
+    needs: [version, create-draft]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+          - arch: aarch64
+    steps:
+      - name: Install Certificates for Code Signing
+        continue-on-error: true
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.CERTIFICATES_P12_PASSWORD }}
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Processing
+        uses: ./.github/actions/setup
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Build with Gradle
+        run: ./gradlew packageDistributionForCurrentOS
+        env:
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+          ORG_GRADLE_PROJECT_revision: ${{ needs.version.outputs.revision }}
+          ORG_GRADLE_PROJECT_compose.desktop.verbose: true
+          ORG_GRADLE_PROJECT_compose.desktop.mac.sign: ${{ secrets.PROCESSING_SIGNING }}
+          ORG_GRADLE_PROJECT_compose.desktop.mac.signing.identity: ${{ secrets.PROCESSING_SIGNING_IDENTITY }}
+          ORG_GRADLE_PROJECT_compose.desktop.mac.notarization.appleID: ${{ secrets.PROCESSING_APPLE_ID }}
+          ORG_GRADLE_PROJECT_compose.desktop.mac.notarization.password: ${{ secrets.PROCESSING_APP_PASSWORD }}
+          ORG_GRADLE_PROJECT_compose.desktop.mac.notarization.teamID: ${{ secrets.PROCESSING_TEAM_ID }}
+
+      - name: Stage release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ASSET_VERSION: ${{ needs.version.outputs.asset_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p release-assets
+          cp "app/build/compose/binaries/main/Processing-${VERSION}.zip" "release-assets/processing-${ASSET_VERSION}-macos-${ARCH}-portable.zip"
+          cp "app/build/compose/binaries/main/dmg/Processing-${VERSION}.dmg" "release-assets/processing-${ASSET_VERSION}-macos-${ARCH}.dmg"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+
+  release-linux:
+    name: (linux/${{ matrix.arch }}) Create Processing Release
+    runs-on: ${{ matrix.os }}
+    needs: [version, create-draft]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            deb: arm64
+          - os: ubuntu-latest
+            arch: x64
+            deb: amd64
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Processing
+        uses: ./.github/actions/setup
+
+      - name: Build with Gradle
+        run: ./gradlew packageDistributionForCurrentOS
+        env:
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+          ORG_GRADLE_PROJECT_revision: ${{ needs.version.outputs.revision }}
+          ORG_GRADLE_PROJECT_compose.desktop.verbose: true
+
+      - name: Stage release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ASSET_VERSION: ${{ needs.version.outputs.asset_version }}
+          ARCH: ${{ matrix.arch }}
+          DEB: ${{ matrix.deb }}
+        run: |
+          mkdir -p release-assets
+          cp "app/build/compose/binaries/main/Processing-${VERSION}.zip" "release-assets/processing-${ASSET_VERSION}-linux-${ARCH}-portable.zip"
+          cp "app/build/compose/binaries/main/deb/processing_${VERSION}-1_${DEB}.deb" "release-assets/processing-${ASSET_VERSION}-linux-${ARCH}.deb"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+
+      - name: Add artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processing_${{ needs.version.outputs.version }}-1_${{ matrix.deb }}.deb
+          retention-days: 1
+          path: app/build/compose/binaries/main/deb/processing_${{ needs.version.outputs.version }}-1_${{ matrix.deb }}.deb
+
+  release-linux-snap:
+    name: (linux/${{ matrix.arch }}) Create Processing Snap Release
+    runs-on: ${{ matrix.os }}
+    needs: [version, create-draft, release-linux]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            deb: arm64
+          - os: ubuntu-latest
+            arch: x64
+            deb: amd64
+    steps:
+      - name: Install Snapcraft
+        uses: samuelmeuli/action-snapcraft@v3
+
+      - name: Install LXD
+        uses: canonical/setup-lxd@main
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: processing_${{ needs.version.outputs.version }}-1_${{ matrix.deb }}.deb
+          path: app/build/compose/binaries/main/deb/
+
+      - name: Build with Gradle
+        run: ./gradlew packageSnap
+        env:
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+          ORG_GRADLE_PROJECT_revision: ${{ needs.version.outputs.revision }}
+          ORG_GRADLE_PROJECT_snapname: ${{ vars.SNAP_NAME }}
+          ORG_GRADLE_PROJECT_snapconfinement: ${{ vars.SNAP_CONFINEMENT }}
+
+      - name: Stage release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ASSET_VERSION: ${{ needs.version.outputs.asset_version }}
+          ARCH: ${{ matrix.arch }}
+          DEB: ${{ matrix.deb }}
+          SNAP_NAME: ${{ vars.SNAP_NAME }}
+        run: |
+          mkdir -p release-assets
+          cp "app/build/compose/binaries/main/${SNAP_NAME}_${VERSION}_${DEB}.snap" "release-assets/processing-${ASSET_VERSION}-linux-${ARCH}.snap"
+
+      - name: Upload snap to release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/processing-${{ needs.version.outputs.asset_version }}-linux-${{ matrix.arch }}.snap
+
+      - name: Upload snap to Snap Store
+        # Release candidates must not push to the Snap Store.
+        if: ${{ needs.version.outputs.is_prerelease != 'true' }}
+        run: snapcraft upload --release=beta app/build/compose/binaries/main/${{ vars.SNAP_NAME }}_${{ needs.version.outputs.version }}_${{ matrix.deb }}.snap
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.PROCESSING_SNAPCRAFT_TOKEN }}
+  release-linux-flatpak:
+    name: (linux/${{ matrix.arch }}) Create Processing Flatpak Release
+    runs-on: ${{ matrix.os }}
+    needs: [version, create-draft, release-linux]
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            deb: arm64
+            farch: aarch64
+          - os: ubuntu-latest
+            arch: x64
+            deb: amd64
+            farch: x86_64
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: processing_${{ needs.version.outputs.version }}-1_${{ matrix.deb }}.deb
+          path: app/build/compose/binaries/main/deb/
+
+      - name: Setup Processing
+        uses: ./.github/actions/setup
+
+      - name: Build with Gradle
+        run: ./gradlew generateFlatpakConfiguration
+        env:
+          ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
+          ORG_GRADLE_PROJECT_group: ${{ vars.GRADLE_GROUP }}
+          ORG_GRADLE_PROJECT_revision: ${{ needs.version.outputs.revision }}
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: processing.flatpak
+          manifest-path: app/build/compose/binaries/main/flatpak/org.processing.pde.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          arch: ${{ matrix.farch }}
+
+      - name: Stage release assets
+        env:
+          ASSET_VERSION: ${{ needs.version.outputs.asset_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p release-assets
+          cp processing.flatpak "release-assets/processing-${ASSET_VERSION}-linux-${ARCH}.flatpak"
+
+      - name: Upload Flatpak to release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/processing-${{ needs.version.outputs.asset_version }}-linux-${{ matrix.arch }}.flatpak
+
+  publish-release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    environment: release
+    needs:
+      - version
+      - create-draft
+      - reference
+      - publish-maven
+      - publish-gradle
+      - release-windows
+      - release-macos
+      - release-linux
+      - release-linux-snap
+      - release-linux-flatpak
+    # Run once nothing has failed. publish-maven/publish-gradle are skipped for
+    # release candidates, and a skipped dependency would otherwise skip this job.
+    if: ${{ !failure() && !cancelled() }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      IS_PRERELEASE: ${{ needs.version.outputs.is_prerelease }}
+    steps:
+      - name: Mark release as published
+        run: |
+          # Release candidates go out as a public prerelease (downloadable, but
+          # not marked "latest" so package-manager watchers ignore them); final
+          # releases are marked latest.
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            gh release edit "$TAG" --draft=false --prerelease
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi

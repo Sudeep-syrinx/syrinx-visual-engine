@@ -1,0 +1,15 @@
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>org.processing.app</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>pde</string>
+            </array>
+        </dict>
+    </array>
+    <key>NSCameraUsageDescription</key>
+    <string>The sketch you're running needs access to your video camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>The sketch you're running needs access to your microphone.</string>
